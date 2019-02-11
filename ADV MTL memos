@@ -1,0 +1,26 @@
+adv 1400 400 200d
+all mean acc: 0.7786458 all mean loss: 0.7023972
+all mean acc: 0.7779514 all mean loss: 0.6890519
+all mean acc: 0.75381947 all mean loss: 0.5849312
+all mean acc: 0.74843746 all mean loss: 0.7069836
+
+non adv 1400 400 200d
+all mean acc: 0.7815972 all mean loss: 0.7516909
+all mean acc: 0.78350705 all mean loss: 0.71751773
+all mean acc: 0.7901042 all mean loss: 0.7386254
+
+adv 50d
+all mean acc: 0.74774295 all mean loss: 0.5698952
+batch 16 all mean acc: 0.8130208 all mean loss: 0.7197152
+
+non adv
+all mean acc: 0.78159726 all mean loss: 0.67108923
+batch 16 all mean acc: 0.811632 all mean loss: 0.7656148
+all mean acc: 0.811632 all mean loss: 0.7656148
+
+
+ADV params [0.06562964579531903, 0.1, 32, 32, 0.0010217605642775806, 8] loss 0.43457824 -> INITIAL POINT dimensions = [(0.0001, 0.1), (0.001, 0.5), [8, 16,32,64], [8, 16,32,64], (0.0005, 0.005), [2, 4, 8,16,32]]-> PARAMS [0.1, 0.001, 8, 8, 0.0005, 8] LOSS 0.38460514 (NOW NO DROPOUT ON TEST). ON THESE PARAMS GOES ALL MEAN ACC: 0.8333334 ALL MEAN LOSS: 0.39033148
+
+non adv init point -> [0.1, 0.5, 8, 8, 0.0005, 4] LOSS 0.41756284, ON ALL MEAN ACC: 0.8217172 ALL MEAN LOSS: 0.43277892
+
+
