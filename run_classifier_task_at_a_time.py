@@ -131,7 +131,7 @@ flags.DEFINE_float(
     "Proportion of training to 12perform linear learning rate warmup for. "
     "E.g., 0.1 = 10% of training.")
 
-flags.DEFINE_integer("save_checkpoints_steps", 250, #TODO THIS IS WHERE EVAL FREQUENCY IS SET
+flags.DEFINE_integer("save_checkpoints_steps", 100, #TODO THIS IS WHERE EVAL FREQUENCY IS SET
                      "How often to save the model checkpoint.")
 
 flags.DEFINE_integer("iterations_per_loop", 1000,
@@ -654,12 +654,12 @@ def hyperparams_wrapper(params):
 
     tf.reset_default_graph()
 
-    FLAGS.adversarial = True
+    FLAGS.adversarial = False
 
     def convert_params_to_string(params):
         st = "_"
         for param in params:
-            st += str(param)[:7]
+            st += str(param)[:15]
             st += "_"
         return st
 
@@ -674,14 +674,15 @@ def hyperparams_wrapper(params):
     FLAGS.max_seq_length = 140 #256
     FLAGS.train_batch_size = params[0]
     FLAGS.learning_rate = params[1]#2e-5
-    FLAGS.orth_loss_weight = params[2]
-    FLAGS.discr_loss_weight = params[3]
-    FLAGS.common_enc_size = params[4]
-    FLAGS.private_enc_size = params[5]
+    #FLAGS.orth_loss_weight = params[2]
+    #FLAGS.discr_loss_weight = params[3]
+    #FLAGS.common_enc_size = params[4]
+    #FLAGS.private_enc_size = params[5]
     FLAGS.num_train_epochs = 3.0
-    FLAGS.output_dir = "./outputs/task_at_a_time/hyperparams_search"+convert_params_to_string(params)
+    #FLAGS.output_dir = "./outputs/task_at_a_time/hyperparams_search"+convert_params_to_string(params)
+    FLAGS.output_dir = "./outputs/task_at_a_time_NO_ADV/hyperparams_search" + convert_params_to_string(params)
 
-    #tf.logging.set_verbosity(tf.logging.INFO)
+    # tf.logging.set_verbosity(tf.logging.INFO)
     # tf.logging.set_verbosity(tf.logging.DEBUG)
 
     '''processors = {
@@ -735,7 +736,7 @@ def hyperparams_wrapper(params):
         cluster=tpu_cluster_resolver,
         master=FLAGS.master,
         model_dir=FLAGS.output_dir,
-        keep_checkpoint_max=5,
+        keep_checkpoint_max=1,
         save_checkpoints_steps=FLAGS.save_checkpoints_steps,
         session_config = tf.ConfigProto(gpu_options=gpu_options),
         tpu_config=tf.contrib.tpu.TPUConfig(
@@ -825,7 +826,7 @@ def hyperparams_wrapper(params):
         # okay SO HERE GOES THE TRAIN
         # let's say minimum steps is 1000 and after that checkpoints will be saved for each 250 steps. If no decrease for next 4 checks then stop.
 
-        stop_hook = tf.contrib.estimator.stop_if_no_decrease_hook(estimator, "eval_loss", 1000, min_steps = 750, run_every_secs=60)
+        stop_hook = tf.contrib.estimator.stop_if_no_decrease_hook(estimator, "eval_loss", max_steps_without_decrease=400, min_steps = 750, run_every_secs=60)
         train_spec = tf.estimator.TrainSpec(input_fn=train_input_fn, max_steps=num_train_steps, hooks=[stop_hook])
 
         #estimator.train(input_fn=train_input_fn, max_steps=num_train_steps)
@@ -896,12 +897,21 @@ def hyperparams_wrapper(params):
 
 def main(_):
 
-  hp_tuning_result = gp_minimize(hyperparams_wrapper, [[8, 12, 14], (1e-5, 5e-4), (1e-2, 0.5), (1e-3, 1e-1), [424, 576, 768], [424, 576, 768]],
-                                 n_calls=40, x0=[14, 5.48386e-5, 0.5, 0.001, 424, 424],
+  #hp_tuning_result = gp_minimize(hyperparams_wrapper, [[8, 12, 14], (5e-6, 1e-4), (1e-2, 0.5), (1e-3, 1e-1), [276, 424, 576, 768], [276, 424, 576, 768]],
+  #                               n_calls=40, x0=[14, 5.48386e-5, 0.5, 0.001, 424, 424],
+  #                               verbose=True)
+  hp_tuning_result = gp_minimize(hyperparams_wrapper, [[8, 12, 14], (5e-6, 1e-4)],
+                                 n_calls=40, x0=[12, 4.5954111903935344e-05],
                                  verbose=True)
+
   #4 tasks opt is PARAMS [8, 0.00012212957106648347, 0.051983923229111814, 0.0483198888684224] LOSS 0.30725384
   #16 tasks opt is 12_0.0001_0.5_0.1_576_768
   #latest corrupted session reaches opt at hyperparams_search_14_5.48386_0.5_0.001_424_424_, loss is 0.19018593430519104
+  #TODO latest adv session reaches opt at hyperparams_search_14_3.41351(e-5)_0.27236_0.08919_276_276_  and global_step = 11750 (-750) 0.94078124
+  #TODO monitor discr loss. Try raising lambda during training.
+
+  #TODO non adv Current minimum: 0.2001 PARAMS [12, 4.5954111903935344e-05] LOSS 0.200081
+  #TODO NON ADV Current minimum: 0.2027 PARAMS [14, 1.6419103411645864e-05] LOSS 0.2026753
   print("PARAMS", hp_tuning_result.x, "LOSS", hp_tuning_result.fun)
   #results = hyperparams_wrapper([8, 0.00012212957106648347, 0.051983923229111814, 0.0483198888684224])
   #print(results)
