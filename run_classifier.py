@@ -25,22 +25,73 @@ import os
 import modeling
 import optimization
 import tokenization
-
-os.environ["CUDA_VISIBLE_DEVICES"]="-1"
-
+#os.environ["CUDA_VISIBLE_DEVICES"]="-1"
 import tensorflow as tf
 import preprocess_corpus
 import numpy as np
+from tensorflow.python.framework import ops
+from skopt import gp_minimize
+
+names = ['Books', 'Electronics', 'Movies_and_TV', 'CDs_and_Vinyl', 'Clothing_Shoes_and_Jewelry', 'Home_and_Kitchen',
+         'Kindle_Store', 'Sports_and_Outdoors',
+         'Cell_Phones_and_Accessories', 'Health_and_Personal_Care',
+         'Toys_and_Games',
+         'Video_Games', 'Tools_and_Home_Improvement', 'Beauty', 'Apps_for_Android', 'Office_Products']
+
+def diff_loss(A, B):
+    return tf.norm(tf.matmul(tf.transpose(tf.to_float(A)), tf.to_float(B)))**2
+#this is modified loss for rank 1
+
+class FlipGradientBuilder(object):
+    '''Gradient Reversal Layer from https://github.com/pumpikano/tf-dann'''
+
+    def __init__(self):
+        self.num_calls = 0
+
+    def __call__(self, x, l=1.0):
+        grad_name = "FlipGradient%d" % self.num_calls
+
+        @ops.RegisterGradient(grad_name)
+        def _flip_gradients(op, grad):
+            return [tf.negative(grad) * l]
+
+        g = tf.get_default_graph()
+        with g.gradient_override_map({"Identity": grad_name}):
+            y = tf.identity(x)
+
+        self.num_calls += 1
+        return y
+
+flip_gradient = FlipGradientBuilder()
+
 
 flags = tf.flags
 
 FLAGS = flags.FLAGS
 
 ## Required parameters
+
+flags.DEFINE_integer(
+    "common_enc_size", 768,
+    "Common encoder units.")
+flags.DEFINE_integer(
+    "private_enc_size", 768,
+    "Private encoder units.")
+
 flags.DEFINE_string(
     "data_dir", None,
     "The input data dir. Should contain the .tsv files (or other data files) "
     "for the task.")
+
+flags.DEFINE_bool(
+    "adversarial", True,
+    "Wherther to use encoders and adversarial module")
+
+flags.DEFINE_float("orth_loss_weight", 0.1,
+                   "Orth loss weight")
+
+flags.DEFINE_float("discr_loss_weight", 0.05,
+                   "Discr loss weight")
 
 flags.DEFINE_string(
     "bert_config_file", None,
@@ -81,9 +132,9 @@ flags.DEFINE_bool(
     "do_predict", False,
     "Whether to run the model in inference mode on the test set.")
 
-flags.DEFINE_integer("train_batch_size", 32, "Total batch size for training.")
+flags.DEFINE_integer("train_batch_size", 1, "Total batch size for training.")
 
-flags.DEFINE_integer("eval_batch_size", 8, "Total batch size for eval.")
+flags.DEFINE_integer("eval_batch_size", 1, "Total batch size for eval.")
 
 flags.DEFINE_integer("predict_batch_size", 8, "Total batch size for predict.")
 
@@ -97,7 +148,7 @@ flags.DEFINE_float(
     "Proportion of training to perform linear learning rate warmup for. "
     "E.g., 0.1 = 10% of training.")
 
-flags.DEFINE_integer("save_checkpoints_steps", 1000,
+flags.DEFINE_integer("save_checkpoints_steps", 250,
                      "How often to save the model checkpoint.")
 
 flags.DEFINE_integer("iterations_per_loop", 1000,
@@ -429,31 +480,59 @@ def create_model(bert_config, is_training, input_ids_list, input_mask_list, segm
   # If you want to use the token-level output, use model.get_sequence_output()
   # instead.
   output_layer_list = model.get_pooled_output()
+  print(len(output_layer_list))
   assert len(output_layer_list) == num_tasks
   loss_list = []
   per_example_loss_list = []
   logits_list, probabilities_list = [], []
-
+  common_encoders_list = []
   hidden_size = output_layer_list[0].shape[-1].value
 
+  orth_loss = 0
+
   for i in range(len(output_layer_list)):
+    if is_training:
+      # I.e., 0.1 dropout
+      output_layer_list[i] = tf.nn.dropout(output_layer_list[i], keep_prob=0.9)
+
+  for i in range(len(output_layer_list)):
+      if FLAGS.adversarial:
+            with tf.variable_scope("common_encoder", reuse=tf.AUTO_REUSE):
+                common_encoders_list.append(tf.layers.dense(inputs=output_layer_list[i],
+                                           units=hidden_size,
+                                           activation=tf.nn.tanh,
+                                           use_bias=True,
+                                           name="common_encoder"
+                                           )) #check that only one common encoder is created!
+
       with tf.variable_scope(str(i)+"_th_task"):
           assert hidden_size == output_layer_list[i].shape[-1].value
 
-
-          output_weights = tf.get_variable(
-              "output_weights", [num_labels, hidden_size],
-              initializer=tf.truncated_normal_initializer(stddev=0.02))
+          if FLAGS.adversarial:
+             output_weights = tf.get_variable(
+                  "output_weights", [num_labels, 2*hidden_size],
+                   initializer=tf.truncated_normal_initializer(stddev=0.02))
+          else:
+             output_weights = tf.get_variable(
+                  "output_weights", [num_labels, hidden_size],
+                  initializer=tf.truncated_normal_initializer(stddev=0.02))
 
           output_bias = tf.get_variable(
               "output_bias", [num_labels], initializer=tf.zeros_initializer())
 
+          if FLAGS.adversarial:
+              private_encoder = tf.layers.dense(inputs=output_layer_list[i],
+                                           units=hidden_size,
+                                           activation=tf.nn.tanh,
+                                           use_bias=True,
+                                           )
+              #orth_loss += diff_loss(tf.stack([common_encoders_list[-1], common_encoders_list[-1]]), tf.stack([private_encoder, private_encoder]))
+              orth_loss += diff_loss(common_encoders_list[-1], private_encoder)
           with tf.variable_scope("loss"):
-            if is_training:
-              # I.e., 0.1 dropout
-              output_layer_list[i] = tf.nn.dropout(output_layer_list[i], keep_prob=0.9)
-
-            logits_list.append(tf.matmul(output_layer_list[i], output_weights, transpose_b=True))
+            if FLAGS.adversarial:
+                logits_list.append(tf.matmul(tf.concat([common_encoders_list[-1],private_encoder], axis=-1), output_weights, transpose_b=True))
+            else:
+                logits_list.append(tf.matmul(output_layer_list[i], output_weights, transpose_b=True))
             logits_list[-1] = tf.nn.bias_add(logits_list[-1], output_bias)
             probabilities_list.append(tf.nn.softmax(logits_list[-1], axis=-1))
             log_probs = tf.nn.log_softmax(logits_list[-1], axis=-1)
@@ -464,8 +543,35 @@ def create_model(bert_config, is_training, input_ids_list, input_mask_list, segm
             per_example_loss_list.append(-tf.reduce_sum(one_hot_labels * log_probs, axis=-1))
             loss_list.append(tf.reduce_mean(per_example_loss_list[-1])) #LOOOOOOOOOSS!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
+  all_common_encoded = tf.concat(common_encoders_list, axis=0) #COMMON_ENC_LIST[I] [BATCH, 768]
+  #assert all_common_encoded.shape.as_list()[0] == num_tasks#batch_size here is strictly 1?
+  #assert all_common_encoded.shape.as_list()[1] == hidden_size
+  print(all_common_encoded.shape.as_list())
+  if FLAGS.adversarial:
+      with tf.variable_scope("task_discriminator"):  # ONLY ONE FOR ALL TASKS
+          discriminator = tf.layers.dense(inputs=flip_gradient(all_common_encoded),
+                                          units=len(names),
+                                          # activation=tf.nn.tanh,
+                                          use_bias=True,
+                                          )
+          discr_log_probs = tf.nn.log_softmax(discriminator, axis=-1)
+
+          task_labels = []
+          for i in range(num_tasks):
+              #for j in range(int(all_common_encoded.shape.as_list()[0]/num_tasks)):
+              for j in range(FLAGS.train_batch_size): #TODO fix this kostyl - what about eval batch_size
+                   task_labels.append(tf.one_hot(i, num_tasks))
+
+
+          discr_loss = tf.reduce_mean(-tf.reduce_sum(task_labels * discr_log_probs, axis=-1))
+  else:
+      discr_loss = 0
+
+
+
+
   assert len(loss_list) == len(per_example_loss_list) == len(logits_list) == len(probabilities_list) == num_tasks
-  return (loss_list, per_example_loss_list, logits_list, probabilities_list) # whats with logits and probs? they go to metrics_fn
+  return (loss_list, per_example_loss_list, logits_list, probabilities_list, orth_loss, discr_loss) # whats with logits and probs? they go to metrics_fn
 
 
 def model_fn_builder(bert_config, num_labels, init_checkpoint, learning_rate,
@@ -480,7 +586,7 @@ def model_fn_builder(bert_config, num_labels, init_checkpoint, learning_rate,
     for name in sorted(features.keys()):
       tf.logging.info("  name = %s, shape = %s" % (name, features[name].shape))
 
-    input_ids_list = features["input_ids_list"]#[num_tasks*seq_length]
+    input_ids_list = features["input_ids_list"]#[num_tasks*seq_length] DECODING !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
     input_mask_list = features["input_mask_list"]#[num_tasks*seq_length]
     segment_ids_list = features["segment_ids_list"] #[num_tasks*seq_length]
     label_ids_list = features["label_ids_list"] # [num_tasks]
@@ -498,7 +604,7 @@ def model_fn_builder(bert_config, num_labels, init_checkpoint, learning_rate,
 
     is_training = (mode == tf.estimator.ModeKeys.TRAIN)
 
-    (total_loss_list, per_example_loss_list, logits_list, probabilities_list) = create_model(  # HO HO HO HERE IS THE LOSS
+    (total_loss_list, per_example_loss_list, logits_list, probabilities_list, orth_loss, discr_loss) = create_model(  # HO HO HO HERE IS THE LOSS
         bert_config, is_training, input_ids_list, input_mask_list, segment_ids_list, label_ids_list,
         num_labels, use_one_hot_embeddings, num_tasks, seq_length)
 
@@ -528,7 +634,7 @@ def model_fn_builder(bert_config, num_labels, init_checkpoint, learning_rate,
 
     output_spec = None
     if mode == tf.estimator.ModeKeys.TRAIN:
-      total_loss = sum(total_loss_list)
+      total_loss = sum(total_loss_list) + FLAGS.discr_loss_weight * discr_loss + FLAGS.orth_loss_weight * orth_loss
       train_op = optimization.create_optimizer(
           total_loss, learning_rate, num_train_steps, num_warmup_steps, use_tpu) # GLOBAL OPTIMIZER
 
@@ -539,16 +645,16 @@ def model_fn_builder(bert_config, num_labels, init_checkpoint, learning_rate,
           scaffold_fn=scaffold_fn)
     elif mode == tf.estimator.ModeKeys.EVAL:
 
-      def metric_fn(per_example_loss_list, label_ids_list, logits_list, is_real_example):
+      def metric_fn(per_example_loss_list, label_ids_list, logits_list, is_real_example): #label_ids_list [batch, num_tasks]
         assert len(per_example_loss_list) == len(logits_list) == num_tasks
         assert  label_ids_list.shape.as_list()[1]==num_tasks
-        label_ids_list = tf.transpose(label_ids_list)
+        label_ids_list = tf.transpose(label_ids_list) #[ num_tasks, batch]
         is_real_example_list, label_ids_list_task, predictions_list = [], [], []
 
         #for per_example_loss, label_ids, logits in zip(per_example_loss_list, label_ids_list, logits_list):
         for i in range(num_tasks):
             #per_example_loss, logits = per_example_loss_list[i], logits_list[i]
-            label_ids_task = label_ids_list[:][i]
+            label_ids_task = label_ids_list[:][i] #really??????? yes - checked on the jupyter
             label_ids_list_task.append(label_ids_task)
             is_real_example_list.append(is_real_example)
             argmaxed = tf.argmax(logits_list[i], axis=-1, output_type=tf.int32)
@@ -601,194 +707,253 @@ def _my_create_examples(texts_list, labels_list, num_tasks, corpus_length):
     assert len(examples) == corpus_length
     return examples
 
-def main(_):
-  names = ['Books', 'Electronics', 'Movies_and_TV', 'CDs_and_Vinyl',
-    'Clothing_Shoes_and_Jewelry', 'Home_and_Kitchen',
-             'Kindle_Store', 'Sports_and_Outdoors', 'Cell_Phones_and_Accessories', 'Health_and_Personal_Care',
-             'Toys_and_Games',
-             'Video_Games', 'Tools_and_Home_Improvement', 'Beauty', 'Apps_for_Android', 'Office_Products']
-  #names = ['Books', 'Electronics']
-  tf.logging.set_verbosity(tf.logging.INFO)
-  #tf.logging.set_verbosity(tf.logging.DEBUG)
+def hyperparams_wrapper(params):
+    tf.reset_default_graph()
 
-  '''processors = {
-      "cola": ColaProcessor,
-      "mnli": MnliProcessor,
-      "mrpc": MrpcProcessor,
-      "xnli": XnliProcessor,
-  }'''
+    FLAGS.adversarial = True
 
-  tokenization.validate_case_matches_checkpoint(FLAGS.do_lower_case,
-                                                FLAGS.init_checkpoint)
+    def convert_params_to_string(params):
+        st = "_"
+        for param in params:
+            st += str(param)[:15]
+            st += "_"
+        return st
 
-  if not FLAGS.do_train and not FLAGS.do_eval and not FLAGS.do_predict:
-    raise ValueError(
-        "At least one of `do_train`, `do_eval` or `do_predict' must be True.")
+    FLAGS.task_name = "MRPC"
+    FLAGS.do_train = True
+    FLAGS.do_eval = True
+    FLAGS.data_dir = "./glue_data/MRPC"
+    FLAGS.vocab_file = "./uncased_L-12_H-768_A-12/vocab.txt"
+    FLAGS.bert_config_file = "./uncased_L-12_H-768_A-12/bert_config.json"
+    FLAGS.init_checkpoint = "./uncased_L-12_H-768_A-12/bert_model.ckpt"
 
-  bert_config = modeling.BertConfig.from_json_file(FLAGS.bert_config_file)
+    FLAGS.max_seq_length = 140
+    FLAGS.train_batch_size = params[0]
+    FLAGS.eval_batch_size = 1 #params[0]
+    FLAGS.learning_rate = params[1]  # 2e-5
+    FLAGS.orth_loss_weight = params[2]
+    FLAGS.discr_loss_weight = params[3]
+    FLAGS.common_enc_size = params[4]
+    FLAGS.private_enc_size = params[5]
+    FLAGS.num_train_epochs = 3.0
+    FLAGS.output_dir = "./outputs/all_tasks_simult/hyperparams_search" + convert_params_to_string(params)
 
-  if FLAGS.max_seq_length > bert_config.max_position_embeddings:
-    raise ValueError(
-        "Cannot use sequence length %d because the BERT model "
-        "was only trained up to sequence length %d" %
-        (FLAGS.max_seq_length, bert_config.max_position_embeddings))
+    tf.logging.set_verbosity(tf.logging.INFO)
+    # tf.logging.set_verbosity(tf.logging.DEBUG)
 
-  tf.gfile.MakeDirs(FLAGS.output_dir)
+    '''processors = {
+        "cola": ColaProcessor,
+        "mnli": MnliProcessor,
+        "mrpc": MrpcProcessor,
+        "xnli": XnliProcessor,
+    }'''
 
-  task_name = FLAGS.task_name.lower()
+    tokenization.validate_case_matches_checkpoint(FLAGS.do_lower_case,
+                                                  FLAGS.init_checkpoint)
 
-  #if task_name not in processors: #MRPC goes here
-  #  raise ValueError("Task not found: %s" % (task_name))
+    if not FLAGS.do_train and not FLAGS.do_eval and not FLAGS.do_predict:
+        raise ValueError(
+            "At least one of `do_train`, `do_eval` or `do_predict' must be True.")
 
-  #processor = processors[task_name]()
+    bert_config = modeling.BertConfig.from_json_file(FLAGS.bert_config_file)
 
-  #label_list = processor.get_labels()
-  label_list = ["0","1"]
+    if FLAGS.max_seq_length > bert_config.max_position_embeddings:
+        raise ValueError(
+            "Cannot use sequence length %d because the BERT model "
+            "was only trained up to sequence length %d" %
+            (FLAGS.max_seq_length, bert_config.max_position_embeddings))
 
-  tokenizer = tokenization.FullTokenizer(
-      vocab_file=FLAGS.vocab_file, do_lower_case=FLAGS.do_lower_case) #what is vocab_file??? --vocab_file=$BERT_BASE_DIR/vocab.txt - COMES FROM PRETRAINED BERT
+    tf.gfile.MakeDirs(FLAGS.output_dir)
 
-  tpu_cluster_resolver = None
-  if FLAGS.use_tpu and FLAGS.tpu_name:
-    tpu_cluster_resolver = tf.contrib.cluster_resolver.TPUClusterResolver(
-        FLAGS.tpu_name, zone=FLAGS.tpu_zone, project=FLAGS.gcp_project)
+    task_name = FLAGS.task_name.lower()
 
-  is_per_host = tf.contrib.tpu.InputPipelineConfig.PER_HOST_V2
-  run_config = tf.contrib.tpu.RunConfig(
-      cluster=tpu_cluster_resolver,
-      master=FLAGS.master,
-      model_dir=FLAGS.output_dir,
-      save_checkpoints_steps=FLAGS.save_checkpoints_steps,
-      tpu_config=tf.contrib.tpu.TPUConfig(
-          iterations_per_loop=FLAGS.iterations_per_loop,
-          num_shards=FLAGS.num_tpu_cores,
-          per_host_input_for_training=is_per_host))
+    # if task_name not in processors: #MRPC goes here
+    #  raise ValueError("Task not found: %s" % (task_name))
 
-  train_examples = None
-  num_train_steps = None
-  num_warmup_steps = None
+    # processor = processors[task_name]()
 
-  train_size = 1400
-  test_size = 400
+    # label_list = processor.get_labels()
+    label_list = ["0", "1"]
 
-  texts_train_list, texts_test_list, labels_train_list, labels_test_list = [],[],[],[]
+    tokenizer = tokenization.FullTokenizer(
+        vocab_file=FLAGS.vocab_file,
+        do_lower_case=FLAGS.do_lower_case)  # what is vocab_file??? --vocab_file=$BERT_BASE_DIR/vocab.txt - COMES FROM PRETRAINED BERT
 
-  if FLAGS.do_train: #TRUE
-    for name in names:
-    #train_examples = processor.get_train_examples(FLAGS.data_dir) # INSERT YOUR CODE HERE - PASS LIST OF whatever!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-        my_texts_train, my_texts_test, my_labels_train, my_labels_test = preprocess_corpus.preprocess(name, "./output", remake=False)
-        assert len(my_texts_train)  == len(my_labels_train) == train_size
-        assert len(my_texts_test) == len(my_labels_test) == test_size
-        #train_examples_list.append(_my_create_examples(texts=my_texts_train, labels=my_labels_train))
-        #test_examples_list.append(_my_create_examples(texts=my_texts_test, labels=my_labels_test))
-        texts_train_list.append(my_texts_train)
-        texts_test_list.append(my_texts_test)
-        labels_train_list.append(my_labels_train)
-        labels_test_list.append(my_labels_test)
-    train_examples = _my_create_examples(texts_train_list, labels_train_list, len(names), corpus_length= train_size)# list of examples
-    eval_examples = _my_create_examples(texts_test_list, labels_test_list, len(names), test_size)  # list of examples
-    num_train_steps = int(
-        train_size / FLAGS.train_batch_size * FLAGS.num_train_epochs)
-    num_warmup_steps = int(num_train_steps * FLAGS.warmup_proportion)
+    tpu_cluster_resolver = None
+    if FLAGS.use_tpu and FLAGS.tpu_name:
+        tpu_cluster_resolver = tf.contrib.cluster_resolver.TPUClusterResolver(
+            FLAGS.tpu_name, zone=FLAGS.tpu_zone, project=FLAGS.gcp_project)
 
-  model_fn = model_fn_builder(#doesnt get examples yet
-      bert_config=bert_config,
-      num_labels=2, #labels_list = [0,1]
-      init_checkpoint=FLAGS.init_checkpoint, #pretrained checkpoint
-      learning_rate=FLAGS.learning_rate,
-      num_train_steps=num_train_steps,
-      num_warmup_steps=num_warmup_steps,
-      use_tpu=FLAGS.use_tpu,
-      use_one_hot_embeddings=FLAGS.use_tpu,
-      num_tasks = len(names),
-      seq_length = FLAGS.max_seq_length,
-  ) # OKAY seems like embs dont need to be one-hot
+    is_per_host = tf.contrib.tpu.InputPipelineConfig.PER_HOST_V2
+    gpu_options = tf.GPUOptions(allow_growth=True)
 
-  # If TPU is not available, this will fall back to normal Estimator on CPU
-  # or GPU.
-  estimator = tf.contrib.tpu.TPUEstimator(
-      use_tpu=FLAGS.use_tpu, # False
-      model_fn=model_fn,
-      config=run_config,
-      train_batch_size=FLAGS.train_batch_size,
-      eval_batch_size=FLAGS.eval_batch_size,
-      predict_batch_size=FLAGS.predict_batch_size)
+    run_config = tf.contrib.tpu.RunConfig(
+        cluster=tpu_cluster_resolver,
+        master=FLAGS.master,
+        model_dir=FLAGS.output_dir,
+        save_checkpoints_steps=FLAGS.save_checkpoints_steps,
+        keep_checkpoint_max=1,
+        session_config=tf.ConfigProto(gpu_options=gpu_options), #report_tensor_allocations_upon_oom = True
+        tpu_config=tf.contrib.tpu.TPUConfig(
+            iterations_per_loop=FLAGS.iterations_per_loop,
+            num_shards=FLAGS.num_tpu_cores,
+            per_host_input_for_training=is_per_host))
 
-  #train_file_list = []
-  if FLAGS.do_train:
+    train_examples = None
+    num_train_steps = None
+    num_warmup_steps = None
 
-    #for i, name in enumerate(names):
-    train_file = os.path.join(FLAGS.output_dir, "train.tf_record")
-    file_based_convert_examples_to_features(
-            train_examples, label_list, FLAGS.max_seq_length, tokenizer, train_file, len(names)) # put binary-serialized features to the train_file
-    tf.logging.info("***** Running training *****")
-    tf.logging.info("  Num examples = %d", len(train_examples))
-    tf.logging.info("  Batch size = %d", FLAGS.train_batch_size)
-    tf.logging.info("  Num steps = %d", num_train_steps)
+    train_size = 4000
+    test_size = 400
 
-    train_input_fn = file_based_input_fn_builder( # THIS FUNCTION RETURNS TRAIN EXAMPLES AND LABELS
-            input_file=train_file, #HERE IS TRAIN FILE
+    texts_train_list, texts_test_list, labels_train_list, labels_test_list = [], [], [], []
+
+    if FLAGS.do_train:  # TRUE
+        for name in names:
+            # train_examples = processor.get_train_examples(FLAGS.data_dir) # INSERT YOUR CODE HERE - PASS LIST OF whatever!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+            my_texts_train, my_texts_test, my_labels_train, my_labels_test = preprocess_corpus.preprocess(name,
+                                                                                                          "./output",
+                                                                                                          remake=False)
+            assert len(my_texts_train) == len(my_labels_train) == train_size
+            assert len(my_texts_test) == len(my_labels_test) == test_size
+            # train_examples_list.append(_my_create_examples(texts=my_texts_train, labels=my_labels_train))
+            # test_examples_list.append(_my_create_examples(texts=my_texts_test, labels=my_labels_test))
+            texts_train_list.append(my_texts_train)
+            texts_test_list.append(my_texts_test)
+            labels_train_list.append(my_labels_train)
+            labels_test_list.append(my_labels_test)
+        train_examples = _my_create_examples(texts_train_list, labels_train_list, len(names),
+                                             corpus_length=train_size)  # list of examples
+        eval_examples = _my_create_examples(texts_test_list, labels_test_list, len(names),
+                                            test_size)  # list of examples
+        num_train_steps = int(
+            train_size / FLAGS.train_batch_size * FLAGS.num_train_epochs)
+        num_warmup_steps = int(num_train_steps * FLAGS.warmup_proportion)
+
+    model_fn = model_fn_builder(  # doesnt get examples yet
+        bert_config=bert_config,
+        num_labels=2,  # labels_list = [0,1]
+        init_checkpoint=FLAGS.init_checkpoint,  # pretrained checkpoint
+        learning_rate=FLAGS.learning_rate,
+        num_train_steps=num_train_steps,
+        num_warmup_steps=num_warmup_steps,
+        use_tpu=FLAGS.use_tpu,
+        use_one_hot_embeddings=FLAGS.use_tpu,
+        num_tasks=len(names),
+        seq_length=FLAGS.max_seq_length,
+    )  # OKAY seems like embs dont need to be one-hot
+
+    # If TPU is not available, this will fall back to normal Estimator on CPU
+    # or GPU.
+    estimator = tf.contrib.tpu.TPUEstimator(
+        use_tpu=FLAGS.use_tpu,  # False
+        model_fn=model_fn,
+        config=run_config,
+        train_batch_size=FLAGS.train_batch_size,
+        eval_batch_size=FLAGS.eval_batch_size,
+        predict_batch_size=FLAGS.predict_batch_size)
+
+    # train_file_list = []
+    if FLAGS.do_train:
+        # for i, name in enumerate(names):
+        train_file = os.path.join(FLAGS.output_dir, "train.tf_record")
+        file_based_convert_examples_to_features(
+            train_examples, label_list, FLAGS.max_seq_length, tokenizer, train_file,
+            len(names))  # put binary-serialized features to the train_file
+        tf.logging.info("***** Running training *****")
+        tf.logging.info("  Num examples = %d", len(train_examples))
+        tf.logging.info("  Batch size = %d", FLAGS.train_batch_size)
+        tf.logging.info("  Num steps = %d", num_train_steps)
+
+        train_input_fn = file_based_input_fn_builder(  # THIS FUNCTION RETURNS TRAIN EXAMPLES AND LABELS
+            input_file=train_file,  # HERE IS TRAIN FILE
             seq_length=FLAGS.max_seq_length,
             is_training=True,
             drop_remainder=True,
-            num_tasks = len(names)
-    )
-    # okay SO HERE GOES THE TRAIN
-    estimator.train(input_fn=train_input_fn, max_steps=num_train_steps) #that is for TPU but kinda falls back to normal estimator - what is it?
+            num_tasks=len(names)
+        )
+        # okay SO HERE GOES THE TRAIN
+        #estimator.train(input_fn=train_input_fn,
+        #                max_steps=num_train_steps)  # that is for TPU but kinda falls back to normal estimator - what is it?
 
-  if FLAGS.do_eval:
-    #eval_examples = processor.get_dev_examples(FLAGS.data_dir) # evaluating on dev - where is test?
+        stop_hook = tf.contrib.estimator.stop_if_no_decrease_hook(estimator, "eval_loss",
+                                                                  max_steps_without_decrease=750, min_steps=750,
+                                                                  run_every_secs=60)
+        train_spec = tf.estimator.TrainSpec(input_fn=train_input_fn, max_steps=num_train_steps, hooks=[stop_hook])
+
+    if FLAGS.do_eval:
+        # eval_examples = processor.get_dev_examples(FLAGS.data_dir) # evaluating on dev - where is test?
+
+        num_actual_eval_examples = len(eval_examples)
+        if FLAGS.use_tpu:
+            # TPU requires a fixed batch size for all batches, therefore the number
+            # of examples must be a multiple of the batch size, or else examples
+            # will get dropped. So we pad with fake examples which are ignored
+            # later on. These do NOT count towards the metric (all tf.metrics
+            # support a per-instance weight, and these get a weight of 0.0).
+            while len(eval_examples) % FLAGS.eval_batch_size != 0:
+                eval_examples.append(PaddingInputExample())
+
+        eval_file = os.path.join(FLAGS.output_dir, "eval.tf_record")
+        file_based_convert_examples_to_features(
+            eval_examples, label_list, FLAGS.max_seq_length, tokenizer, eval_file, num_tasks=len(names))
+
+        tf.logging.info("***** Running evaluation *****")
+        tf.logging.info("  Num examples = %d (%d actual, %d padding)",
+                        len(eval_examples), num_actual_eval_examples,
+                        len(eval_examples) - num_actual_eval_examples)
+        tf.logging.info("  Batch size = %d", FLAGS.eval_batch_size)
+
+        # This tells the estimator to run through the entire set.
+        eval_steps = None
+        # However, if running eval on the TPU, you will need to specify the
+        # number of steps.
+        if FLAGS.use_tpu:
+            assert len(eval_examples) % FLAGS.eval_batch_size == 0
+            eval_steps = int(len(eval_examples) // FLAGS.eval_batch_size)
+
+        eval_drop_remainder = True if FLAGS.use_tpu else False
+        eval_input_fn = file_based_input_fn_builder(
+            input_file=eval_file,
+            seq_length=FLAGS.max_seq_length,
+            is_training=False,
+            drop_remainder=eval_drop_remainder,
+            num_tasks=len(names)
+
+        )
+
+        eval_spec = tf.estimator.EvalSpec(input_fn=eval_input_fn, steps=eval_steps, start_delay_secs=120,
+                                          throttle_secs=0)
+        tf.logging.info("start experiment...")
+
+        tf.estimator.train_and_evaluate(
+            estimator,
+            train_spec,
+            eval_spec
+        )
+
+        result = estimator.evaluate(input_fn=eval_input_fn, steps=eval_steps)
+
+        output_eval_file = os.path.join(FLAGS.output_dir, "eval_results.txt")
+        with tf.gfile.GFile(output_eval_file, "w") as writer:
+            tf.logging.info("***** Eval results *****")
+            # print("***** Eval results *****")
+            for key in sorted(result.keys()):
+                tf.logging.info("  %s = %s", key, str(result[key]))
+                # print(key, str(result[key]))
+                writer.write("%s = %s\n" % (key, str(result[key])))
+    return result["eval_loss"]
+
+def main(_):
+    hp_tuning_result = gp_minimize(hyperparams_wrapper, [[1,2], (1e-5, 1e-3), (1e-2, 0.5), (1e-3, 1e-1), [256, 424, 576, 768], [256, 424, 576, 768]],
+                                   n_calls=30, x0=[2, 5.905854465935257e-05, 0.5, 0.0482198888684224, 424, 424],
+                                   verbose=True)
+    # 2_0.0001272644197_0.1275340837484_0.0637559622762_768_256_ is for 0.25
+    #  TODO Current minimum: 0.1907 PARAMS [2, 5.905854465935257e-05, 0.5, 0.049983964758675954, 768, 576] LOSS 0.19069473
+    #
+    print("PARAMS", hp_tuning_result.x, "LOSS", hp_tuning_result.fun)
 
 
-
-    num_actual_eval_examples = len(eval_examples)
-    if FLAGS.use_tpu:
-      # TPU requires a fixed batch size for all batches, therefore the number
-      # of examples must be a multiple of the batch size, or else examples
-      # will get dropped. So we pad with fake examples which are ignored
-      # later on. These do NOT count towards the metric (all tf.metrics
-      # support a per-instance weight, and these get a weight of 0.0).
-      while len(eval_examples) % FLAGS.eval_batch_size != 0:
-        eval_examples.append(PaddingInputExample())
-
-    eval_file = os.path.join(FLAGS.output_dir, "eval.tf_record")
-    file_based_convert_examples_to_features(
-        eval_examples, label_list, FLAGS.max_seq_length, tokenizer, eval_file, num_tasks = len(names))
-
-    tf.logging.info("***** Running evaluation *****")
-    tf.logging.info("  Num examples = %d (%d actual, %d padding)",
-                    len(eval_examples), num_actual_eval_examples,
-                    len(eval_examples) - num_actual_eval_examples)
-    tf.logging.info("  Batch size = %d", FLAGS.eval_batch_size)
-
-    # This tells the estimator to run through the entire set.
-    eval_steps = None
-    # However, if running eval on the TPU, you will need to specify the
-    # number of steps.
-    if FLAGS.use_tpu:
-      assert len(eval_examples) % FLAGS.eval_batch_size == 0
-      eval_steps = int(len(eval_examples) // FLAGS.eval_batch_size)
-
-    eval_drop_remainder = True if FLAGS.use_tpu else False
-    eval_input_fn = file_based_input_fn_builder(
-        input_file=eval_file,
-        seq_length=FLAGS.max_seq_length,
-        is_training=False,
-        drop_remainder=eval_drop_remainder,
-        num_tasks= len(names)
-
-    )
-
-    result = estimator.evaluate(input_fn=eval_input_fn, steps=eval_steps)
-
-    output_eval_file = os.path.join(FLAGS.output_dir, "eval_results.txt")
-    with tf.gfile.GFile(output_eval_file, "w") as writer:
-      tf.logging.info("***** Eval results *****")
-      print("***** Eval results *****")
-      for key in sorted(result.keys()):
-        tf.logging.info("  %s = %s", key, str(result[key]))
-        print(key, str(result[key]))
-        writer.write("%s = %s\n" % (key, str(result[key])))
 '''
   if FLAGS.do_predict: # say False
     predict_examples = processor.get_test_examples(FLAGS.data_dir) # predict goes on test
@@ -839,8 +1004,8 @@ def main(_):
 
 if __name__ == "__main__":
   #flags.mark_flag_as_required("data_dir")
-  flags.mark_flag_as_required("task_name")
-  flags.mark_flag_as_required("vocab_file")
-  flags.mark_flag_as_required("bert_config_file")
-  flags.mark_flag_as_required("output_dir")
+  #flags.mark_flag_as_required("task_name")
+  #flags.mark_flag_as_required("vocab_file")
+  #flags.mark_flag_as_required("bert_config_file")
+  #flags.mark_flag_as_required("output_dir")
   tf.app.run()
